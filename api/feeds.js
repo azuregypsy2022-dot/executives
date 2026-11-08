@@ -19,12 +19,12 @@
 //            Deen, Gordon Ramsay, JunsKitchen, Just One Cookbook
 //            (Cooking with Dog was swapped out: its newest video is about
 //            a year old, archive only)
-//   flights  OpenSky Network live aircraft states (free, no key) — live
+//   flights  adsb.lol live aircraft states (free, no key) — live
 //            flights in the air over the continental US, not charter
-//            booking availability. 25s timeout + one retry on a smaller
-//            area (15s): the anonymous tier is flaky (answers in ~2s
-//            from this VM, times out even from a normal browser at
-//            other times). Last-good fallback, same as estates.
+//            booking availability. 25s timeout; OpenSky is now only
+//            the fallback (15s, small box): it never completes from
+//            Vercel's serverless runtime even with a 25s timeout.
+//            Last-good fallback, same as estates.
 //
 // A feed that fails with no last-good data returns [] plus an entry in
 // `errors`; the page shows that section as temporarily unavailable
@@ -444,53 +444,68 @@ async function fetchChefs() {
 }
 
 async function fetchFlights() {
-  // OpenSky is the only free live air-traffic API that needs no key.
-  // Its anonymous tier is flaky — it answers in ~2s from this VM but
-  // times out even from a normal browser at other times, and Vercel's
-  // shared egress IPs get throttled — so allow 25s on the full-US box
-  // and one retry over a smaller area (15s) before giving up; the
-  // last-good fallback in buildFeeds then serves the last successful
-  // result with its age instead of an empty list. Alternatives checked
-  // 2026-11-08 and rejected: airplanes.live (403, needs allowlisting),
-  // adsb.one (Cloudflare-blocked), adsb.fi (API paths 404),
-  // Flightradar24 (Cloudflare-blocked), ADS-B Exchange / FlightAware
-  // (need API keys).
-  const boxes = [
-    { q: "lamin=24&lomin=-125&lamax=50&lomax=-66", ms: 25000 },
-    { q: "lamin=30&lomin=-110&lamax=45&lomax=-75", ms: 15000 },
-  ];
-  let lastErr = null;
-  for (let i = 0; i < boxes.length; i++) {
-    try {
-      const data = JSON.parse(
-        await fetchText(
-          "https://opensky-network.org/api/states/all?" + boxes[i].q,
-          boxes[i].ms
-        )
-      );
-      const states = Array.isArray(data.states) ? data.states : [];
-      const airborne = states
-        .filter((st) => st && st[8] === false && st[1] && String(st[1]).trim())
-        .map((st) => ({
-          id: st[0],
-          callsign: String(st[1]).trim(),
-          country: st[2] || "",
-          lat: st[6],
-          lon: st[5],
-          alt: st[7] != null ? Math.round(st[7] * 3.28084) : null,
-          speed: st[9] != null ? Math.round(st[9] * 1.94384) : null,
-          heading: st[10] != null ? Math.round(st[10]) : null,
-        }))
-        .sort((a, b) => (b.alt || 0) - (a.alt || 0))
-        .slice(0, 8);
-      if (!airborne.length) throw new Error("OpenSky returned no airborne flights");
-      return airborne;
-    } catch (e) {
-      lastErr = e;
-    }
-    if (i < boxes.length - 1) await new Promise((r) => setTimeout(r, 1000));
+  // adsb.lol is the primary source now: free, no key, answers in ~2s
+  // from this VM (verified 2026-11-08: 4,600+ aircraft, ~3,900 airborne
+  // with callsigns over the continental US). OpenSky never completes
+  // from Vercel's serverless runtime even with a 25s timeout, so it is
+  // now only the fallback. The last-good fallback in buildFeeds serves
+  // the last successful result with its age if both fail.
+  // Alternatives checked 2026-11-08 and rejected: airplanes.live (403,
+  // needs allowlisting), adsb.one (Cloudflare-blocked), adsb.fi (API
+  // paths 404), Flightradar24 (Cloudflare-blocked), ADS-B Exchange /
+  // FlightAware / AviationStack (need API keys).
+  try {
+    const data = JSON.parse(
+      await fetchText(
+        "https://api.adsb.lol/v2/lat/39/lon/-98/dist/1500",
+        25000
+      )
+    );
+    const ac = Array.isArray(data.ac) ? data.ac : [];
+    const airborne = ac
+      .filter((a) => a && typeof a.alt_baro === "number" && (a.flight || "").trim())
+      .map((a) => ({
+        id: a.hex || ("A" + Math.random().toString(36).slice(2, 8)),
+        callsign: String(a.flight).trim(),
+        country: "",
+        lat: a.lat,
+        lon: a.lon,
+        alt: Math.round(a.alt_baro),
+        speed: a.gs != null ? Math.round(a.gs) : null,
+        heading: a.track != null ? Math.round(a.track) : null,
+      }))
+      .sort((x, y) => (y.alt || 0) - (x.alt || 0))
+      .slice(0, 8);
+    if (!airborne.length) throw new Error("adsb.lol returned no airborne flights");
+    return airborne;
+  } catch (e) {
+    // fall through to the OpenSky fallback
   }
-  throw lastErr || new Error("OpenSky failed");
+  // OpenSky fallback, small box only — adsb.lol already covers the
+  // full US, so only one 15s OpenSky attempt is worth the time.
+  const data = JSON.parse(
+    await fetchText(
+      "https://opensky-network.org/api/states/all?lamin=30&lomin=-110&lamax=45&lomax=-75",
+      15000
+    )
+  );
+  const states = Array.isArray(data.states) ? data.states : [];
+  const airborne = states
+    .filter((st) => st && st[8] === false && st[1] && String(st[1]).trim())
+    .map((st) => ({
+      id: st[0],
+      callsign: String(st[1]).trim(),
+      country: st[2] || "",
+      lat: st[6],
+      lon: st[5],
+      alt: st[7] != null ? Math.round(st[7] * 3.28084) : null,
+      speed: st[9] != null ? Math.round(st[9] * 1.94384) : null,
+      heading: st[10] != null ? Math.round(st[10]) : null,
+    }))
+    .sort((a, b) => (b.alt || 0) - (a.alt || 0))
+    .slice(0, 8);
+  if (!airborne.length) throw new Error("OpenSky returned no airborne flights");
+  return airborne;
 }
 
 // ---- last-good fallback (estates + flights) ----
