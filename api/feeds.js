@@ -8,7 +8,8 @@
 //   news     BBC News RSS (AP News blocks server-side fetch with Cloudflare)
 //   antiques GoAntiques homepage listings (eBay blocks server-side fetch)
 //   estates  LandFlip land-for-sale listings (LandWatch blocks server-side
-//            fetch with Akamai)
+//            fetch with Akamai); LandHub (landhub.com) as fallback —
+//            LandFlip rate-limits bursts with transient 403s.
 //   chefs    YouTube channels (RSS feed first, channel /videos page as
 //            fallback — the RSS endpoint is unreliable). Channels: Paula
 //            Deen, Gordon Ramsay, JunsKitchen, Just One Cookbook
@@ -16,7 +17,9 @@
 //            a year old, archive only)
 //   flights  OpenSky Network live aircraft states (free, no key) — live
 //            flights in the air over the continental US, not charter
-//            booking availability
+//            booking availability. 12s timeout + one retry on a smaller
+//            area (8s): the anonymous tier can be slow from shared server
+//            IPs (Vercel egress throttling) and the fetch then aborts.
 //
 // A feed that fails returns [] plus an entry in `errors`; the page shows
 // that section as temporarily unavailable instead of inventing items.
@@ -179,28 +182,35 @@ async function fetchAntiques() {
 }
 
 async function fetchEstates() {
-  // LandFlip rate-limits bursts on the search page (transient 403s that
-  // clear after a short pause). Try the search page, then the homepage
-  // (which carries the same listing cards), before giving up.
-  const urls = [
+  // LandFlip rate-limits bursts (transient 403s that clear after a short
+  // pause). Try its search page twice, then its homepage, then fall back
+  // to LandHub (a separate land-listing marketplace) before giving up.
+  // Pauses sit between tries only, so a failing chain stays fast.
+  const tries = [
+    "https://www.landflip.com/land-for-sale",
     "https://www.landflip.com/land-for-sale",
     "https://www.landflip.com/",
   ];
   let lastErr = null;
-  for (const url of urls) {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const html = await fetchText(url, 12000);
-        const estates = parseLandFlip(html);
-        if (estates.length) return estates;
-        lastErr = new Error("LandFlip returned no listings");
-      } catch (e) {
-        lastErr = e;
-      }
-      await new Promise((r) => setTimeout(r, 1500));
+  for (let i = 0; i < tries.length; i++) {
+    try {
+      const html = await fetchText(tries[i], 10000);
+      const estates = parseLandFlip(html);
+      if (estates.length) return estates;
+      lastErr = new Error("LandFlip returned no listings");
+    } catch (e) {
+      lastErr = e;
     }
+    if (i < tries.length - 1) await new Promise((r) => setTimeout(r, 2000));
   }
-  throw lastErr || new Error("LandFlip failed");
+  try {
+    const html = await fetchText("https://www.landhub.com/property-for-sale", 12000);
+    const estates = parseLandHub(html);
+    if (estates.length) return estates;
+    throw new Error("LandHub returned no listings");
+  } catch (e) {
+    throw lastErr || e;
+  }
 }
 
 function parseLandFlip(html) {
@@ -228,6 +238,50 @@ function parseLandFlip(html) {
     });
   }
   if (!out.length) throw new Error("LandFlip returned no listings");
+  return out;
+}
+
+function parseLandHub(html) {
+  // LandHub (landhub.com) search page: each listing appears as a
+  // /property/<slug> link; the card's <img alt> carries "#ID <title>
+  // $<price>" and the card body carries county, acres and a photo.
+  const out = [];
+  const seen = new Set();
+  const linkRe = /href="(\/property\/[^"]+)"/gi;
+  let m;
+  while ((m = linkRe.exec(html)) && out.length < 6) {
+    const slug = m[1];
+    if (seen.has(slug)) continue;
+    seen.add(slug);
+    const win = html.slice(m.index, m.index + 4500);
+    const altM = win.match(/<img[^>]*alt="([^"]+)"/i);
+    const priceM = win.match(/\$[\d,]+(?:\.\d{2})?/);
+    if (!altM || !priceM) continue;
+    const title = cleanText(altM[1])
+      .replace(/^#\S+\s+/, "")
+      .replace(/\s*\$[\d,]+(?:\.\d{2})?$/, "")
+      .trim();
+    if (!title) continue;
+    const price = priceM[0].replace(/\.00$/, "");
+    const acresM = win.match(/([\d.]+)\s*Acres?/i);
+    const countyM = win.match(/([A-Z][A-Za-z]*(?: [A-Z][A-Za-z]*)* County)/);
+    const imgM = win.match(/\/_next\/image\?url=(https%3A%2F%2Fimg\.landhub\.com[^"&]+)/i);
+    let img = "";
+    if (imgM) {
+      try { img = decodeURIComponent(imgM[1]); } catch (e) { img = ""; }
+    }
+    out.push({
+      id: "E-" + (out.length + 1),
+      title: title.slice(0, 90),
+      loc: countyM ? cleanText(countyM[1]).trim() : "United States",
+      price,
+      size: acresM ? (acresM[1] === "1" ? "1 acre" : acresM[1] + " acres") : "",
+      status: "Available",
+      url: "https://www.landhub.com" + slug,
+      img,
+    });
+  }
+  if (!out.length) throw new Error("LandHub returned no listings");
   return out;
 }
 
@@ -303,29 +357,50 @@ async function fetchChefs() {
 }
 
 async function fetchFlights() {
-  const data = JSON.parse(
-    await fetchText(
-      "https://opensky-network.org/api/states/all?lamin=24&lomin=-125&lamax=50&lomax=-66",
-      10000
-    )
-  );
-  const states = Array.isArray(data.states) ? data.states : [];
-  const airborne = states
-    .filter((st) => st && st[8] === false && st[1] && String(st[1]).trim())
-    .map((st) => ({
-      id: st[0],
-      callsign: String(st[1]).trim(),
-      country: st[2] || "",
-      lat: st[6],
-      lon: st[5],
-      alt: st[7] != null ? Math.round(st[7] * 3.28084) : null,
-      speed: st[9] != null ? Math.round(st[9] * 1.94384) : null,
-      heading: st[10] != null ? Math.round(st[10]) : null,
-    }))
-    .sort((a, b) => (b.alt || 0) - (a.alt || 0))
-    .slice(0, 8);
-  if (!airborne.length) throw new Error("OpenSky returned no airborne flights");
-  return airborne;
+  // OpenSky is the only free live air-traffic API that needs no key.
+  // Its anonymous tier can be slow from shared server IPs (Vercel's
+  // egress addresses get throttled, and the fetch then aborts on the
+  // timeout), so allow a longer timeout and one retry over a smaller
+  // area before giving up. Alternatives checked 2026-11-08 and
+  // rejected: airplanes.live (403, needs allowlisting), adsb.one
+  // (Cloudflare-blocked), adsb.fi (API paths 404), Flightradar24
+  // (Cloudflare-blocked), ADS-B Exchange / FlightAware (need API keys).
+  const boxes = [
+    { q: "lamin=24&lomin=-125&lamax=50&lomax=-66", ms: 12000 },
+    { q: "lamin=30&lomin=-110&lamax=45&lomax=-75", ms: 8000 },
+  ];
+  let lastErr = null;
+  for (let i = 0; i < boxes.length; i++) {
+    try {
+      const data = JSON.parse(
+        await fetchText(
+          "https://opensky-network.org/api/states/all?" + boxes[i].q,
+          boxes[i].ms
+        )
+      );
+      const states = Array.isArray(data.states) ? data.states : [];
+      const airborne = states
+        .filter((st) => st && st[8] === false && st[1] && String(st[1]).trim())
+        .map((st) => ({
+          id: st[0],
+          callsign: String(st[1]).trim(),
+          country: st[2] || "",
+          lat: st[6],
+          lon: st[5],
+          alt: st[7] != null ? Math.round(st[7] * 3.28084) : null,
+          speed: st[9] != null ? Math.round(st[9] * 1.94384) : null,
+          heading: st[10] != null ? Math.round(st[10]) : null,
+        }))
+        .sort((a, b) => (b.alt || 0) - (a.alt || 0))
+        .slice(0, 8);
+      if (!airborne.length) throw new Error("OpenSky returned no airborne flights");
+      return airborne;
+    } catch (e) {
+      lastErr = e;
+    }
+    if (i < boxes.length - 1) await new Promise((r) => setTimeout(r, 1000));
+  }
+  throw lastErr || new Error("OpenSky failed");
 }
 
 // ---- handler ----
