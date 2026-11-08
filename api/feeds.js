@@ -7,9 +7,13 @@
 // Sources (all verified live 2026-11-07):
 //   news     BBC News RSS (AP News blocks server-side fetch with Cloudflare)
 //   antiques GoAntiques homepage listings (eBay blocks server-side fetch)
-//   estates  LandFlip land-for-sale listings (LandWatch blocks server-side
-//            fetch with Akamai); LandHub (landhub.com) as fallback —
-//            LandFlip rate-limits bursts with transient 403s.
+//   estates  LandHub first, then LandCentury, Mossy Oak Properties,
+//            then LandFlip last (LandWatch blocks server-side fetch
+//            with Akamai; LandFlip 403s server-side fetches from every
+//            IP tested; LandHub parses cleanly from a normal IP but
+//            Vercel's egress addresses got nothing from it on Nov 8).
+//            Last-good: on a fresh-fetch failure the last successful
+//            result is served with its age instead of an empty list.
 //   chefs    YouTube channels (RSS feed first, channel /videos page as
 //            fallback — the RSS endpoint is unreliable). Channels: Paula
 //            Deen, Gordon Ramsay, JunsKitchen, Just One Cookbook
@@ -17,12 +21,16 @@
 //            a year old, archive only)
 //   flights  OpenSky Network live aircraft states (free, no key) — live
 //            flights in the air over the continental US, not charter
-//            booking availability. 12s timeout + one retry on a smaller
-//            area (8s): the anonymous tier can be slow from shared server
-//            IPs (Vercel egress throttling) and the fetch then aborts.
+//            booking availability. 25s timeout + one retry on a smaller
+//            area (15s): the anonymous tier is flaky (answers in ~2s
+//            from this VM, times out even from a normal browser at
+//            other times). Last-good fallback, same as estates.
 //
-// A feed that fails returns [] plus an entry in `errors`; the page shows
-// that section as temporarily unavailable instead of inventing items.
+// A feed that fails with no last-good data returns [] plus an entry in
+// `errors`; the page shows that section as temporarily unavailable
+// instead of inventing items. A feed served from last-good data
+// carries `stale: { label, fetchedAt }` so the page can say how old
+// the items are.
 
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
@@ -83,7 +91,11 @@ async function fetchText(url, ms) {
   try {
     const r = await fetch(url, {
       signal: ctrl.signal,
-      headers: { "User-Agent": UA, Accept: "text/html,application/xml,application/rss+xml,text/xml,*/*" },
+      headers: {
+        "User-Agent": UA,
+        Accept: "text/html,application/xml,application/rss+xml,text/xml,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
     });
     if (!r.ok) throw new Error("HTTP " + r.status + " for " + url);
     return await r.text();
@@ -182,35 +194,33 @@ async function fetchAntiques() {
 }
 
 async function fetchEstates() {
-  // LandFlip rate-limits bursts (transient 403s that clear after a short
-  // pause). Try its search page twice, then its homepage, then fall back
-  // to LandHub (a separate land-listing marketplace) before giving up.
-  // Pauses sit between tries only, so a failing chain stays fast.
+  // LandFlip returns 403 to server-side fetches from every IP we can
+  // test from (this VM and Vercel), so it goes last now. LandHub is
+  // first — it parses cleanly from a normal IP, but Vercel's egress
+  // addresses got nothing from it on Nov 8, so LandCentury and Mossy
+  // Oak Properties (both return 200 with parseable listings) follow
+  // before LandFlip gets its one last try. Any source that returns
+  // real listings wins immediately.
   const tries = [
-    "https://www.landflip.com/land-for-sale",
-    "https://www.landflip.com/land-for-sale",
-    "https://www.landflip.com/",
+    { url: "https://www.landhub.com/property-for-sale", ms: 12000, parse: parseLandHub, name: "LandHub" },
+    { url: "https://www.landcentury.com/land-for-sale", ms: 12000, parse: parseLandCentury, name: "LandCentury" },
+    { url: "https://www.mossyoakproperties.com/land-for-sale/", ms: 12000, parse: parseMossyOak, name: "Mossy Oak" },
+    { url: "https://www.landflip.com/land-for-sale", ms: 8000, parse: parseLandFlip, name: "LandFlip" },
+    { url: "https://www.landflip.com/", ms: 8000, parse: parseLandFlip, name: "LandFlip" },
   ];
   let lastErr = null;
   for (let i = 0; i < tries.length; i++) {
     try {
-      const html = await fetchText(tries[i], 10000);
-      const estates = parseLandFlip(html);
+      const html = await fetchText(tries[i].url, tries[i].ms);
+      const estates = tries[i].parse(html);
       if (estates.length) return estates;
-      lastErr = new Error("LandFlip returned no listings");
+      lastErr = new Error(tries[i].name + " returned no listings");
     } catch (e) {
       lastErr = e;
     }
-    if (i < tries.length - 1) await new Promise((r) => setTimeout(r, 2000));
+    if (i < tries.length - 1) await new Promise((r) => setTimeout(r, 1000));
   }
-  try {
-    const html = await fetchText("https://www.landhub.com/property-for-sale", 12000);
-    const estates = parseLandHub(html);
-    if (estates.length) return estates;
-    throw new Error("LandHub returned no listings");
-  } catch (e) {
-    throw lastErr || e;
-  }
+  throw lastErr || new Error("No estate source returned listings");
 }
 
 function parseLandFlip(html) {
@@ -282,6 +292,83 @@ function parseLandHub(html) {
     });
   }
   if (!out.length) throw new Error("LandHub returned no listings");
+  return out;
+}
+
+function parseLandCentury(html) {
+  // LandCentury (Next.js): each listing is an <a class="...listing-card_card__...">
+  // to /land-for-sale/<state>/<slug>; the card carries a price span, a
+  // facts line ("4.91 acres · $2,536/acre"), a place line with county,
+  // and an <img alt> with the full title ("... - $8,500 | Owner Financing").
+  const out = [];
+  const seen = new Set();
+  const linkRe = /<a[^>]*class="[^"]*listing-card_card__[^"]*"[^>]*href="(\/land-for-sale\/[^"]+)"/gi;
+  let m;
+  while ((m = linkRe.exec(html)) && out.length < 6) {
+    const slug = m[1];
+    if (seen.has(slug)) continue;
+    seen.add(slug);
+    const win = html.slice(m.index, m.index + 6000);
+    const priceM = win.match(/listing-card_price__[A-Za-z0-9_-]*">(\$[\d,]+)/);
+    const altM = win.match(/<img[^>]*alt="([^"]+)"/i);
+    const factsM = win.match(/listing-card_facts__[A-Za-z0-9_-]*">([^<]+)</);
+    const countyM = win.match(/listing-card_county__[A-Za-z0-9_-]*">([^<]+)</);
+    const placeM = win.match(/listing-card_place__[A-Za-z0-9_-]*"><span>([^<]+)</);
+    const imgM = win.match(/\/_next\/image\?url=(https%3A%2F%2F[^"&]+)/i);
+    if (!priceM || !altM) continue;
+    const title = cleanText(altM[1])
+      .replace(/\s*-\s*\$[\d,]+.*$/, "")
+      .replace(/\s*\|\s*Owner Financing\s*$/i, "")
+      .trim();
+    if (!title) continue;
+    const acresM = factsM ? factsM[1].match(/([\d.]+)\s*acres?/i) : null;
+    let img = "";
+    if (imgM) {
+      try { img = decodeURIComponent(imgM[1]); } catch (e) { img = ""; }
+    }
+    out.push({
+      id: "E-" + (out.length + 1),
+      title: title.slice(0, 90),
+      loc: countyM
+        ? cleanText(countyM[1]).trim()
+        : (placeM ? cleanText(placeM[1]).replace(/\s*\d{5}\s*$/, "").trim() : "United States"),
+      price: priceM[1],
+      size: acresM ? (acresM[1] === "1" ? "1 acre" : acresM[1] + " acres") : "",
+      status: "Available",
+      url: "https://www.landcentury.com" + slug,
+      img,
+    });
+  }
+  if (!out.length) throw new Error("LandCentury returned no listings");
+  return out;
+}
+
+function parseMossyOak(html) {
+  // Mossy Oak Properties: each listing is a <div class="rs-listing-card
+  // rs-listing-item"> with a card-title anchor (href + title), location
+  // spans, a "3,239± Acres" label, a price label, and an <img> (RealStack CDN).
+  const out = [];
+  const blocks = html.split("rs-listing-card rs-listing-item").slice(1, 7);
+  for (const b of blocks) {
+    const titleM = b.match(/card-title">\s*<a[^>]*href="(https:\/\/www\.mossyoakproperties\.com\/property\/[^"]+)"[^>]*>([^<]{5,200})<\/a>/i);
+    const acresM = b.match(/label--acre">([\d,]+)±?\s*Acres?/i);
+    const priceM = b.match(/label--price">(\$[\d,]+)/i);
+    const locM = b.match(/<div class="location">\s*<span>\s*([^<,]+),?\s*<\/span>\s*<span>([A-Z]{2})<\/span>/i);
+    const imgM = b.match(/<img[^>]*src="(https:\/\/images\.realstack\.com[^"]+\.(?:jpg|jpeg|webp))"/i)
+      || b.match(/data-src="(https:\/\/images\.realstack\.com[^"]+\.(?:jpg|jpeg|webp))"/i);
+    if (!titleM || !priceM) continue;
+    out.push({
+      id: "E-" + (out.length + 1),
+      title: cleanText(titleM[2]).slice(0, 90),
+      loc: locM ? (cleanText(locM[1]).trim() + ", " + locM[2]) : "United States",
+      price: priceM[1],
+      size: acresM ? acresM[1].replace(/,/g, "") + " acres" : "",
+      status: "Available",
+      url: titleM[1],
+      img: imgM ? imgM[1] : "",
+    });
+  }
+  if (!out.length) throw new Error("Mossy Oak returned no listings");
   return out;
 }
 
@@ -358,16 +445,19 @@ async function fetchChefs() {
 
 async function fetchFlights() {
   // OpenSky is the only free live air-traffic API that needs no key.
-  // Its anonymous tier can be slow from shared server IPs (Vercel's
-  // egress addresses get throttled, and the fetch then aborts on the
-  // timeout), so allow a longer timeout and one retry over a smaller
-  // area before giving up. Alternatives checked 2026-11-08 and
-  // rejected: airplanes.live (403, needs allowlisting), adsb.one
-  // (Cloudflare-blocked), adsb.fi (API paths 404), Flightradar24
-  // (Cloudflare-blocked), ADS-B Exchange / FlightAware (need API keys).
+  // Its anonymous tier is flaky — it answers in ~2s from this VM but
+  // times out even from a normal browser at other times, and Vercel's
+  // shared egress IPs get throttled — so allow 25s on the full-US box
+  // and one retry over a smaller area (15s) before giving up; the
+  // last-good fallback in buildFeeds then serves the last successful
+  // result with its age instead of an empty list. Alternatives checked
+  // 2026-11-08 and rejected: airplanes.live (403, needs allowlisting),
+  // adsb.one (Cloudflare-blocked), adsb.fi (API paths 404),
+  // Flightradar24 (Cloudflare-blocked), ADS-B Exchange / FlightAware
+  // (need API keys).
   const boxes = [
-    { q: "lamin=24&lomin=-125&lamax=50&lomax=-66", ms: 12000 },
-    { q: "lamin=30&lomin=-110&lamax=45&lomax=-75", ms: 8000 },
+    { q: "lamin=24&lomin=-125&lamax=50&lomax=-66", ms: 25000 },
+    { q: "lamin=30&lomin=-110&lamax=45&lomax=-75", ms: 15000 },
   ];
   let lastErr = null;
   for (let i = 0; i < boxes.length; i++) {
@@ -403,21 +493,81 @@ async function fetchFlights() {
   throw lastErr || new Error("OpenSky failed");
 }
 
+// ---- last-good fallback (estates + flights) ----
+
+// In-memory store, per warm function instance: when a fresh fetch of
+// estates or flights fails, serve the last successful result and label
+// it with its age, so the feed shows real recent items instead of
+// going empty. Never invented — stale data always carries its age.
+// Note: a cold start or a different Vercel instance has no last-good
+// data yet, so the first-ever failure still shows the "temporarily
+// unavailable" message.
+const lastGood = {
+  estates: { at: 0, items: null },
+  flights: { at: 0, items: null },
+};
+
+function ageLabel(at) {
+  const mins = Math.max(0, Math.floor((Date.now() - at) / 60000));
+  if (mins < 1) return "updated just now";
+  if (mins < 60) return "updated " + mins + " min ago";
+  const h = Math.floor(mins / 60);
+  if (h < 24) return "updated " + h + (h === 1 ? " hour ago" : " hours ago");
+  return "updated " + Math.floor(h / 24) + "d ago";
+}
+
+async function withLastGood(key, fetcher) {
+  try {
+    const items = await fetcher();
+    if (items && items.length) {
+      lastGood[key] = { at: Date.now(), items };
+      return { items, stale: null };
+    }
+    throw new Error("no items returned");
+  } catch (e) {
+    const lg = lastGood[key];
+    if (lg.items && lg.items.length) {
+      return {
+        items: lg.items,
+        stale: { label: ageLabel(lg.at), fetchedAt: new Date(lg.at).toISOString() },
+      };
+    }
+    throw e;
+  }
+}
+
+// Recompute stale age labels from their fetchedAt timestamps, so a
+// cached response never understates how old its last-good data is.
+function refreshStaleLabels(data) {
+  if (!data || !data.stale) return data;
+  for (const k of ["estates", "flights"]) {
+    const st = data.stale[k];
+    if (st && st.fetchedAt) st.label = ageLabel(Date.parse(st.fetchedAt));
+  }
+  return data;
+}
+
 // ---- handler ----
 
 async function buildFeeds() {
   const settled = await Promise.allSettled([
     fetchAntiques(),
     fetchNews(),
-    fetchEstates(),
+    withLastGood("estates", fetchEstates),
     fetchChefs(),
-    fetchFlights(),
+    withLastGood("flights", fetchFlights),
   ]);
   const keys = ["antiques", "news", "estates", "chefs", "flights"];
-  const data = { updatedAt: new Date().toISOString(), errors: {} };
+  const data = { updatedAt: new Date().toISOString(), errors: {}, stale: { estates: null, flights: null } };
   settled.forEach((r, i) => {
     if (r.status === "fulfilled") {
-      data[keys[i]] = r.value;
+      const v = r.value;
+      if (v && typeof v === "object" && "items" in v) {
+        data[keys[i]] = v.items;
+        data.stale[keys[i]] = v.stale;
+      } else {
+        data[keys[i]] = v;
+      }
       data.errors[keys[i]] = null;
     } else {
       data[keys[i]] = [];
@@ -432,13 +582,13 @@ module.exports = async (req, res) => {
     if (cache.data && Date.now() - cache.at < CACHE_MS) {
       res.setHeader("Content-Type", "application/json");
       res.setHeader("Cache-Control", "s-maxage=300, stale-while-revalidate=600");
-      return res.status(200).json(cache.data);
+      return res.status(200).json(refreshStaleLabels(cache.data));
     }
     const data = await buildFeeds();
     cache = { at: Date.now(), data };
     res.setHeader("Content-Type", "application/json");
     res.setHeader("Cache-Control", "s-maxage=300, stale-while-revalidate=600");
-    return res.status(200).json(data);
+    return res.status(200).json(refreshStaleLabels(data));
   } catch (e) {
     return res.status(500).json({ error: "feeds failed", message: String((e && e.message) || e) });
   }
